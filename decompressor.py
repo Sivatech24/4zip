@@ -12,7 +12,8 @@ def varint_decode(f):
         shift += 7
     return result
 
-def decompress_file(dict_bin, input_bin, output_txt):
+
+def decompress_file(dict_bin, input_bin, output_bin):
     dictionary = {}
 
     # Load dictionary
@@ -24,19 +25,29 @@ def decompress_file(dict_bin, input_bin, output_txt):
 
             length = varint_decode(f)
             pattern = f.read(length).decode("ascii")
-
             dictionary[idx] = pattern
 
-    # Rebuild output bitstream
-    with open(input_bin, "rb") as f_in, open(output_txt, "w") as f_out:
+    # Decode index bit patterns
+    full_bits = ""
+
+    with open(input_bin, "rb") as f_in:
         while True:
             idx = varint_decode(f_in)
             if idx is None:
                 break
-            pattern = dictionary.get(idx, "")
-            f_out.write(pattern)
+            full_bits += dictionary.get(idx, "")
+
+    # Convert bits → bytes
+    out_bytes = bytearray()
+    for i in range(0, len(full_bits), 8):
+        byte_bits = full_bits[i:i+8]
+        if len(byte_bits) == 8:
+            out_bytes.append(int(byte_bits, 2))
+
+    with open(output_bin, "wb") as f_out:
+        f_out.write(bytes(out_bytes))
 
 
 if __name__ == "__main__":
-    decompress_file("indexfile.bin", "output.bin", "restored.txt")
-    print("Decompression completed!")
+    decompress_file("indexfile.bin", "output.bin", "restored.bin")
+    print("Decompression done.")
