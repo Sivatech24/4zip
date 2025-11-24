@@ -25,3 +25,18 @@ decompressor: decompressor.c
 clean:
 	rm -f compressor decompressor *.o
 
+codingmaster24@DESKTOP-P6HE9CF:/mnt/c/Users/codingmaster24/Documents/4zip$ make
+gcc -O3 -march=native -Wall compressor.c -o compressor -lzstd -lcrypto -lpthread
+gcc -O3 -march=native -Wall decompressor.c -o decompressor -lzstd
+codingmaster24@DESKTOP-P6HE9CF:/mnt/c/Users/codingmaster24/Documents/4zip$ ./compressor input.bin compress
+File: input.bin, size=26561841 bytes, chunk=4194304, chunks=7
+Launching 4 worker threads; ZSTD level=19
+Compression complete: compress/input.bin.cmp and compress/input.bin.meta
+codingmaster24@DESKTOP-P6HE9CF:/mnt/c/Users/codingmaster24/Documents/4zip$ ./decompressor compress/input.bin.cmp compress/input.bin.meta decompress
+Decompressed to decompress/input.bin
+codingmaster24@DESKTOP-P6HE9CF:/mnt/c/Users/codingmaster24/Documents/4zip$ cmp --silent input.bin decompress/input.bin && echo "OK" || echo "Mismatch!"
+md5sum input.bin decompress/input.bin
+OK
+8ee0129689221cf7e029e07fcb10126b  input.bin
+8ee0129689221cf7e029e07fcb10126b  decompress/input.bin
+

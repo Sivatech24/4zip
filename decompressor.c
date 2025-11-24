@@ -1,5 +1,5 @@
 // decompressor.c
-// Reads <compress_dir>/<name>.cmp and .meta and reconstructs original file into <decompress_dir>/<name>
+// Decompress files created by compressor.c
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -7,104 +7,13 @@
 #include <stdint.h>
 #include <string.h>
 #include <zstd.h>
-#include <openssl/sha.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <inttypes.h>
 
-static int ensure_dir(const char *path) {
-    struct stat st;
-    if (stat(path, &st) == 0) return 0;
-    return mkdir(path, 0755);
-}
-
-static void hex_to_bin(const char *hex, unsigned char *out) {
-    for (int i = 0; i < 32; ++i) {
-        char a = hex[i*2], b = hex[i*2+1];
-        unsigned char va = (a>='a') ? (10 + a - 'a') : (a>='A' ? 10 + a - 'A' : a - '0');
-        unsigned char vb = (b>='a') ? (10 + b - 'a') : (b>='A' ? 10 + b - 'A' : b - '0');
-        out[i] = (va << 4) | (vb & 0xF);
-    }
-}
-
-int decompress_file(const char *cmp_path, const char *meta_path, const char *out_dir) {
-    FILE *fcmp = fopen(cmp_path, "rb");
-    if (!fcmp) { perror("open cmp"); return -1; }
-    FILE *fmeta = fopen(meta_path, "r");
-    if (!fmeta) { perror("open meta"); fclose(fcmp); return -1; }
-
-    uint64_t total_size;
-    uint32_t chunk_size;
-    uint32_t num_chunks;
-    if (fread(&total_size, sizeof(uint64_t), 1, fcmp) != 1) { fprintf(stderr,"bad header\n"); fclose(fcmp); fclose(fmeta); return -1; }
-    if (fread(&chunk_size, sizeof(uint32_t), 1, fcmp) != 1) { fprintf(stderr,"bad header\n"); fclose(fcmp); fclose(fmeta); return -1; }
-    if (fread(&num_chunks, sizeof(uint32_t), 1, fcmp) != 1) { fprintf(stderr,"bad header\n"); fclose(fcmp); fclose(fmeta); return -1; }
-
-    if (ensure_dir(out_dir) != 0) { /* ignore */ }
-
-    // determine base name for output
-    const char *base = strrchr(cmp_path, '/');
-    base = base ? base+1 : cmp_path;
-    char out_path[1024];
-    snprintf(out_path, sizeof(out_path), "%s/%s", out_dir, base);
-
-    // if cmp filename has .cmp, strip or keep? We'll write same base name (with .cmp) as earlier compressor did.
-    FILE *fout = fopen(out_path, "wb");
-    if (!fout) { perror("create out"); fclose(fcmp); fclose(fmeta); return -1; }
-
-    // We'll read meta lines to know orig_size and expected sha, and read comp_size + data in same order
-    for (uint32_t i = 0; i < num_chunks; ++i) {
-        unsigned int id;
-        size_t orig_size;
-        unsigned int comp_size;
-        char shahex[128];
-        if (fscanf(fmeta, "%u %zu %u %127s", &id, &orig_size, &comp_size, shahex) != 4) {
-            fprintf(stderr, "meta parse error at chunk %u\n", i); break;
-        }
-
-        // read comp_size from cmp file (should match)
-        uint32_t cs_from_file;
-        if (fread(&cs_from_file, sizeof(uint32_t), 1, fcmp) != 1) { fprintf(stderr,"cmp truncated\n"); break; }
-        if (cs_from_file != comp_size) {
-            fprintf(stderr, "comp size mismatch chunk %u (meta %u file %u)\n", i, comp_size, cs_from_file);
-            // continue but try to trust cs_from_file
-        }
-        uint32_t cs_read = cs_from_file;
-
-        if (cs_read == 0) {
-            // nothing compressed (shouldn't happen here)
-            continue;
-        }
-
-        void *cbuf = malloc(cs_read);
-        if (!cbuf) break;
-        if (fread(cbuf, 1, cs_read, fcmp) != cs_read) { free(cbuf); break; }
-
-        void *outbuf = malloc(orig_size);
-        if (!outbuf) { free(cbuf); break; }
-
-        int dec = ZSTD_decompress(outbuf, orig_size, cbuf, cs_read);
-        if (ZSTD_isError(dec)) {
-            fprintf(stderr, "ZSTD decompress error chunk %u: %s\n", i, ZSTD_getErrorName(dec));
-            free(cbuf); free(outbuf); break;
-        }
-        // validate sha256
-        unsigned char sha_expected[32];
-        hex_to_bin(shahex, sha_expected);
-        unsigned char sha_now[32];
-        SHA256(outbuf, dec, sha_now);
-        if (memcmp(sha_now, sha_expected, 32) != 0) {
-            fprintf(stderr, "SHA mismatch on chunk %u\n", i);
-            // still write, but warn
-        }
-        fwrite(outbuf, 1, dec, fout);
-        free(cbuf); free(outbuf);
-    }
-
-    fclose(fout);
-    fclose(fcmp);
-    fclose(fmeta);
-    printf("Decompressed to %s\n", out_path);
-    return 0;
+static const char* basename_from_path(const char* path) {
+    const char *p = strrchr(path, '/');
+    return p ? p+1 : path;
 }
 
 int main(int argc, char **argv) {
@@ -112,5 +21,88 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Usage: %s <cmp_file> <meta_file> <decompress_dir>\n", argv[0]);
         return 1;
     }
-    return decompress_file(argv[1], argv[2], argv[3]);
+    const char *cmp_path = argv[1];
+    const char *meta_path = argv[2];
+    const char *out_dir = argv[3];
+
+    mkdir(out_dir, 0755);
+
+    FILE *fcmp = fopen(cmp_path, "rb");
+    if (!fcmp) { perror("open cmp"); return 1; }
+
+    // read header
+    uint64_t orig_size;
+    uint64_t chunk_size;
+    uint32_t num_chunks;
+    if (fread(&orig_size, sizeof(uint64_t), 1, fcmp) != 1) { fprintf(stderr, "bad file header\n"); fclose(fcmp); return 1; }
+    if (fread(&chunk_size, sizeof(uint64_t), 1, fcmp) != 1) { fprintf(stderr, "bad file header\n"); fclose(fcmp); return 1; }
+    if (fread(&num_chunks, sizeof(uint32_t), 1, fcmp) != 1) { fprintf(stderr, "bad file header\n"); fclose(fcmp); return 1; }
+
+    // Open meta to read per-chunk orig_size and comp_size order
+    FILE *fmeta = fopen(meta_path, "r");
+    if (!fmeta) { perror("open meta"); fclose(fcmp); return 1; }
+
+    // prepare output file path
+    const char *base = basename_from_path(cmp_path);
+    char outpath[1024];
+    snprintf(outpath, sizeof(outpath), "%s/%s", out_dir, base);
+    // remove .cmp suffix if present
+    size_t blen = strlen(outpath);
+    if (blen > 4 && strcmp(outpath + blen - 4, ".cmp") == 0) outpath[blen - 4] = '\0';
+
+    FILE *fout = fopen(outpath, "wb");
+    if (!fout) { perror("create out"); fclose(fcmp); fclose(fmeta); return 1; }
+
+    // For each chunk, read comp_size (8) then compressed data from cmp file, and read meta entry to know orig_size
+    for (uint32_t i = 0; i < num_chunks; ++i) {
+        uint64_t csize64;
+        if (fread(&csize64, sizeof(uint64_t), 1, fcmp) != 1) { fprintf(stderr, "cmp corrupted\n"); break; }
+        size_t csize = (size_t)csize64;
+
+        // read meta line: id orig_size comp_size sha256hex
+        int mid;
+        uint64_t orig_sz_meta;
+        uint64_t comp_sz_meta;
+        char shahex[65];
+        if (fscanf(fmeta, "%d %" SCNu64 " %" SCNu64 " %64s\n", &mid, &orig_sz_meta, &comp_sz_meta, shahex) != 4) {
+            fprintf(stderr, "meta parse error\n"); break;
+        }
+        // read compressed bytes
+        unsigned char *cbuf = NULL;
+        if (csize > 0) {
+            cbuf = (unsigned char*)malloc(csize);
+            if (!cbuf) { fprintf(stderr, "OOM\n"); break; }
+            if (fread(cbuf, 1, csize, fcmp) != csize) { fprintf(stderr, "cmp read short\n"); free(cbuf); break; }
+        }
+
+        // allocate output buf for decompressed chunk
+        size_t out_size_expected = (size_t)orig_sz_meta;
+        unsigned char *outbuf = (unsigned char*)malloc(out_size_expected);
+        if (!outbuf) { fprintf(stderr, "OOM outbuf\n"); if (cbuf) free(cbuf); break; }
+
+        if (csize == 0) {
+            // nothing compressed? write zeros or skip; here skip
+            free(outbuf);
+            if (cbuf) free(cbuf);
+            continue;
+        }
+
+        size_t r = ZSTD_decompress(outbuf, out_size_expected, cbuf, csize);
+        if (ZSTD_isError(r)) {
+            fprintf(stderr, "Decompress error chunk %d: %s\n", i, ZSTD_getErrorName(r));
+            free(outbuf); free(cbuf); break;
+        }
+        // write decompressed bytes
+        fwrite(outbuf, 1, r, fout);
+
+        free(outbuf);
+        if (cbuf) free(cbuf);
+    }
+
+    fclose(fout);
+    fclose(fcmp);
+    fclose(fmeta);
+
+    printf("Decompressed to %s\n", outpath);
+    return 0;
 }
