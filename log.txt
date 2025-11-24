@@ -6,3 +6,22 @@ nvcc -O3 -Xcompiler -fPIC -c cuda_hash.cu -o cuda_hash.o
 gcc -O3 -Wall -march=native compressor.c cuda_hash.o -o compressor -llz4 -lpthread -L/usr/local/cuda/lib64 -lcudart
 gcc -O3 -Wall -march=native decompressor.c -o decompressor -llz4 -lpthread
 
+NVCC = nvcc
+CC   = gcc
+CFLAGS = -O3 -Wall -march=native
+LDFLAGS = -lzstd -lssl -lcrypto -lpthread -L/usr/local/cuda/lib64 -lcudart
+
+all: compressor decompressor
+
+cuda_sha256.o: cuda_sha256.cu
+	$(NVCC) -O3 -Xcompiler -fPIC -c cuda_sha256.cu -o cuda_sha256.o
+
+compressor: compressor.c cuda_sha256.o
+	$(CC) $(CFLAGS) compressor.c cuda_sha256.o -o compressor $(LDFLAGS)
+
+decompressor: decompressor.c
+	$(CC) $(CFLAGS) decompressor.c -o decompressor -lzstd -lpthread
+
+clean:
+	rm -f compressor decompressor *.o
+
