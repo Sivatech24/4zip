@@ -1,14 +1,12 @@
 // cuda_hash.cu
-// Simple CUDA kernel to compute a 32-bit fnv1a-like hash per block.
-// Exported function: gpu_hash_chunks(unsigned char* data, size_t chunk_size, int num_chunks, unsigned int* out_hashes)
-
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <cstdio>
+#include <cstdlib>
 
 extern "C" {
 
-__device__ inline uint32_t fnv1a32(const unsigned char* data, size_t len) {
+__device__ inline uint32_t fnv1a32_device(const unsigned char* data, size_t len) {
     uint32_t hash = 2166136261u;
     for (size_t i = 0; i < len; ++i) {
         hash ^= (uint32_t)data[i];
@@ -17,58 +15,54 @@ __device__ inline uint32_t fnv1a32(const unsigned char* data, size_t len) {
     return hash;
 }
 
-__global__ void kernel_hash_blocks(const unsigned char* d_buf, size_t chunk_size, int num_chunks, uint32_t* out_hashes, size_t total_bytes) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_chunks) return;
-
-    size_t start = (size_t)idx * chunk_size;
-    size_t remain = (start + chunk_size <= total_bytes) ? chunk_size : (total_bytes - start);
-    const unsigned char* ptr = d_buf + start;
-    out_hashes[idx] = fnv1a32(ptr, remain);
+__global__ void kernel_hash_chunk(const unsigned char* d_buf, size_t len, uint32_t* out_hash) {
+    // single-threaded device hash (len may be up to chunk size)
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        *out_hash = fnv1a32_device(d_buf, len);
+    }
 }
 
-int gpu_hash_chunks(unsigned char* h_buf, size_t total_bytes, size_t chunk_size, int num_chunks, uint32_t* out_hashes_host) {
+int gpu_hash_chunk(const unsigned char* h_buf, size_t len, uint32_t* out_hash_host) {
+    if (!h_buf || !out_hash_host) return -1;
     unsigned char* d_buf = nullptr;
-    uint32_t* d_hashes = nullptr;
-    size_t buf_bytes = total_bytes;
+    uint32_t* d_hash = nullptr;
+    cudaError_t err;
 
-    cudaError_t err = cudaMalloc((void**)&d_buf, buf_bytes);
+    err = cudaMalloc((void**)&d_buf, len);
     if (err != cudaSuccess) {
         fprintf(stderr, "cudaMalloc d_buf failed: %s\n", cudaGetErrorString(err));
         return -1;
     }
-    err = cudaMemcpy(d_buf, h_buf, buf_bytes, cudaMemcpyHostToDevice);
+    err = cudaMemcpy(d_buf, h_buf, len, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         fprintf(stderr, "cudaMemcpy H->D failed: %s\n", cudaGetErrorString(err));
         cudaFree(d_buf);
         return -2;
     }
-    err = cudaMalloc((void**)&d_hashes, num_chunks * sizeof(uint32_t));
+    err = cudaMalloc((void**)&d_hash, sizeof(uint32_t));
     if (err != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc d_hashes failed: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "cudaMalloc d_hash failed: %s\n", cudaGetErrorString(err));
         cudaFree(d_buf);
         return -3;
     }
 
-    int threads = 256;
-    int blocks = (num_chunks + threads - 1) / threads;
-    kernel_hash_blocks<<<blocks, threads>>>(d_buf, chunk_size, num_chunks, d_hashes, buf_bytes);
+    kernel_hash_chunk<<<1, 1>>>(d_buf, len, d_hash);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "kernel launch failed: %s\n", cudaGetErrorString(err));
-        cudaFree(d_buf); cudaFree(d_hashes);
+        cudaFree(d_buf); cudaFree(d_hash);
         return -4;
     }
 
-    err = cudaMemcpy(out_hashes_host, d_hashes, num_chunks * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    err = cudaMemcpy(out_hash_host, d_hash, sizeof(uint32_t), cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
         fprintf(stderr, "cudaMemcpy D->H failed: %s\n", cudaGetErrorString(err));
-        cudaFree(d_buf); cudaFree(d_hashes);
+        cudaFree(d_buf); cudaFree(d_hash);
         return -5;
     }
 
     cudaFree(d_buf);
-    cudaFree(d_hashes);
+    cudaFree(d_hash);
     return 0;
 }
 

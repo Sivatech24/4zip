@@ -1,3 +1,4 @@
+# Makefile
 NVCC = nvcc
 CC = gcc
 CFLAGS = -O3 -Wall -march=native

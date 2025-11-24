@@ -1,1 +1,8 @@
 python compressor.py
+
+codingmaster24@DESKTOP-P6HE9CF:/mnt/c/Users/codingmaster24/Documents/4zip$ mkdir -p compress decompress
+codingmaster24@DESKTOP-P6HE9CF:/mnt/c/Users/codingmaster24/Documents/4zip$ make
+nvcc -O3 -Xcompiler -fPIC -c cuda_hash.cu -o cuda_hash.o
+gcc -O3 -Wall -march=native compressor.c cuda_hash.o -o compressor -llz4 -lpthread -L/usr/local/cuda/lib64 -lcudart
+gcc -O3 -Wall -march=native decompressor.c -o decompressor -llz4 -lpthread
+
