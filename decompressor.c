@@ -3,81 +3,76 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <string.h>
-#include <lz4.h>
+#include <zstd.h>
 #include <sys/stat.h>
-#include <unistd.h>
+#include <string.h>
 
-int decompress_file(const char* cmp_path, const char* meta_path, const char* out_dir) {
+static size_t read_u64(FILE* f, uint64_t* out) {
+    if (fread(out, sizeof(uint64_t), 1, f) != 1) return 0;
+    return 1;
+}
+
+int decompress_container(const char* cmp_path, const char* meta_path, const char* out_dir) {
     FILE* fcmp = fopen(cmp_path, "rb");
     if (!fcmp) { perror("open cmp"); return -1; }
-    FILE* fmeta = fopen(meta_path, "r");
-    if (!fmeta) { perror("open meta"); fclose(fcmp); return -1; }
+    // read header
+    char magic[8]; memset(magic,0,sizeof(magic));
+    if (fread(magic, 1, 7, fcmp) != 7) { fclose(fcmp); return -1; }
+    if (strncmp(magic, "ZSTDCP1", 7) != 0) { fprintf(stderr, "Bad magic\n"); fclose(fcmp); return -1; }
+    uint64_t total_size, chunk_size, num_chunks;
+    if (!read_u64(fcmp, &total_size)) { fclose(fcmp); return -1; }
+    if (!read_u64(fcmp, &chunk_size)) { fclose(fcmp); return -1; }
+    if (!read_u64(fcmp, &num_chunks)) { fclose(fcmp); return -1; }
 
-    uint64_t total_size;
-    uint64_t chunk_size;
-    int num_chunks;
-    if (fread(&total_size, sizeof(uint64_t), 1, fcmp) != 1) { fprintf(stderr, "bad header\n"); fclose(fcmp); fclose(fmeta); return -1; }
-    if (fread(&chunk_size, sizeof(uint64_t), 1, fcmp) != 1) { fprintf(stderr, "bad header\n"); fclose(fcmp); fclose(fmeta); return -1; }
-    if (fread(&num_chunks, sizeof(int), 1, fcmp) != 1) { fprintf(stderr, "bad header\n"); fclose(fcmp); fclose(fmeta); return -1; }
-
-    // create output path
-    const char* baseptr = strrchr(cmp_path, '/');
-    const char* basename = baseptr ? baseptr + 1 : cmp_path;
-    char out_path[1024];
-    snprintf(out_path, sizeof(out_path), "%s/%s", out_dir, basename);
-
+    // ensure out dir exists
     mkdir(out_dir, 0755);
-    FILE* fout = fopen(out_path, "wb");
-    if (!fout) { perror("create out"); fclose(fcmp); fclose(fmeta); return -1; }
 
-    // Read meta lines and then read compressed blocks in same order
-    for (int i = 0; i < num_chunks; ++i) {
-        int id; size_t orig_size; int comp_size; unsigned int hash;
-        if (fscanf(fmeta, "%d %zu %d %u", &id, &orig_size, &comp_size, &hash) != 4) {
-            fprintf(stderr, "meta parse error at chunk %d\n", i); break;
-        }
+    // output path
+    const char* base = strrchr(cmp_path, '/'); base = base ? base + 1 : cmp_path;
+    char outpath[1024];
+    snprintf(outpath, sizeof(outpath), "%s/%s", out_dir, base);
+    // remove .cmp suffix if present
+    char *dot = strrchr(outpath, '.');
+    if (dot && strcmp(dot, ".cmp") == 0) *dot = 0;
 
-        // read comp_size field from cmp file
-        int cs_from_file;
-        if (fread(&cs_from_file, sizeof(int), 1, fcmp) != 1) { fprintf(stderr, "cmp read size failed\n"); break; }
+    FILE* fout = fopen(outpath, "wb");
+    if (!fout) { perror("create out"); fclose(fcmp); return -1; }
 
-        if (cs_from_file == -1) {
-            // raw uncompressed block was stored
-            uint64_t orig_s;
-            if (fread(&orig_s, sizeof(uint64_t), 1, fcmp) != 1) { fprintf(stderr, "raw size read failed\n"); break; }
-            unsigned char* buf = malloc((size_t)orig_s);
-            if (!buf) break;
-            if (fread(buf, 1, (size_t)orig_s, fcmp) != orig_s) { free(buf); break; }
-            fwrite(buf, 1, (size_t)orig_s, fout);
+    for (uint64_t i=0;i<num_chunks;i++) {
+        unsigned char flag;
+        if (fread(&flag, 1, 1, fcmp) != 1) { fprintf(stderr, "read flag fail\n"); break; }
+        uint64_t orig_size, stored_size;
+        if (!read_u64(fcmp, &orig_size)) { fprintf(stderr, "read orig_size fail\n"); break; }
+        if (!read_u64(fcmp, &stored_size)) { fprintf(stderr, "read stored_size fail\n"); break; }
+
+        if (flag == 1) {
+            // raw copy
+            unsigned char *buf = malloc(stored_size);
+            if (!buf) { fprintf(stderr,"OOM\n"); break; }
+            if (fread(buf, 1, stored_size, fcmp) != stored_size) { free(buf); break; }
+            fwrite(buf, 1, stored_size, fout);
             free(buf);
         } else {
-            if (cs_from_file <= 0) {
-                fprintf(stderr, "invalid comp size %d\n", cs_from_file);
-                break;
+            // compressed block
+            unsigned char *cbuf = malloc(stored_size);
+            if (!cbuf) { fprintf(stderr,"OOM\n"); break; }
+            if (fread(cbuf, 1, stored_size, fcmp) != stored_size) { free(cbuf); break; }
+            unsigned char *outbuf = malloc(orig_size);
+            if (!outbuf) { free(cbuf); break; }
+            size_t dec = ZSTD_decompress(outbuf, orig_size, cbuf, stored_size);
+            if (ZSTD_isError(dec)) {
+                fprintf(stderr, "Decompress error chunk %zu: %s\n", (size_t)i, ZSTD_getErrorName(dec));
+                free(outbuf); free(cbuf); break;
             }
-            char* comp_buf = malloc(cs_from_file);
-            if (!comp_buf) break;
-            if (fread(comp_buf, 1, cs_from_file, fcmp) != (size_t)cs_from_file) { free(comp_buf); break; }
-
-            char* out_buf = malloc(orig_size);
-            if (!out_buf) { free(comp_buf); break; }
-            int dec = LZ4_decompress_safe(comp_buf, out_buf, cs_from_file, (int)orig_size);
-            if (dec < 0) {
-                fprintf(stderr, "LZ4 decompress failed for chunk %d\n", i);
-                // fallback: write nothing or attempt something else
-            } else {
-                fwrite(out_buf, 1, dec, fout);
-            }
-            free(comp_buf);
-            free(out_buf);
+            fwrite(outbuf, 1, dec, fout);
+            free(outbuf);
+            free(cbuf);
         }
     }
 
     fclose(fout);
     fclose(fcmp);
-    fclose(fmeta);
-    printf("Decompressed to %s\n", out_path);
+    printf("Decompressed to %s\n", outpath);
     return 0;
 }
 
@@ -86,5 +81,5 @@ int main(int argc, char** argv) {
         printf("Usage: %s <cmp_file> <meta_file> <decompress_dir>\n", argv[0]);
         return 1;
     }
-    return decompress_file(argv[1], argv[2], argv[3]);
+    return decompress_container(argv[1], argv[2], argv[3]);
 }

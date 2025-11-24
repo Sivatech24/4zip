@@ -1,8 +1,8 @@
-// cuda_hash_stub.c
+// cuda_sha256_stub.c
+#include <stddef.h>
 #include <stdint.h>
-int gpu_hash_chunk(const unsigned char* h_buf, size_t len, uint32_t* out_hash_host) {
-    // signal GPU not available
-    (void)h_buf; (void)len;
-    if (out_hash_host) *out_hash_host = 0;
+int gpu_sha256(const unsigned char* data, size_t len, unsigned char out32[32]) {
+    // stub: indicate GPU not available; return non-zero to force CPU fallback
+    (void)data; (void)len; (void)out32;
     return -1;
 }

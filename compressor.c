@@ -1,212 +1,287 @@
 // compressor.c
+// Stream + chunked compression using ZSTD (max level) and per-chunk SHA256 (OpenSSL).
+// Optionally calls gpu_sha256(data, len, out32) if provided (returns 0 on success).
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <inttypes.h>
 #include <string.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <openssl/sha.h>
+#include <zstd.h>
 #include <sys/stat.h>
-#include <lz4.h>
-#include <errno.h>
+#include <openssl/sha.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-int gpu_hash_chunk(const unsigned char* h_buf, size_t len, uint32_t* out_hash_host);
-#ifdef __cplusplus
-}
-#endif
-
-// Default chunk size: 64 MB (change to 128 * 1024 * 1024 for 128 MB)
 #ifndef CHUNK_SIZE
-#define CHUNK_SIZE (64ULL * 1024ULL * 1024ULL)
+// default chunk size: 4MB (you can change via -DCHUNK_SIZE=8388608)
+#define CHUNK_SIZE (4 * 1024 * 1024)
 #endif
+
+// If you provide a GPU implementation in cuda_sha256.cu, it should expose:
+// extern "C" int gpu_sha256(const unsigned char* data, size_t len, unsigned char out32[32]);
+// Return 0 on success, non-zero on error (in which case CPU fallback is used).
+extern int gpu_sha256(const unsigned char* data, size_t len, unsigned char out32[32]);
+/* If the GPU implementation is not linked, the linker will fail.
+   To avoid link error, we provide a weak symbol fallback below in the Makefile compilation:
+   compile cuda_sha256_stub.c which defines gpu_sha256 returning -1.
+*/
 
 typedef struct {
     int id;
-    unsigned char* data; // owns this buffer
-    size_t size;
-    char* comp_buf;      // compressed data (allocated)
-    int comp_size;       // compressed size
-    uint32_t hash;
-} Job;
+    size_t orig_size;
+    size_t comp_size;
+    unsigned char sha256[32];
+    unsigned char *data; // owns the chunk data
+} ChunkResult;
 
 typedef struct {
-    Job* jobs;
-    int count;
-    int next;
-    pthread_mutex_t lock;
-} JobQueue;
+    const char *input_path;
+    const char *out_dir;
+} JobArgs;
 
-static JobQueue g_queue;
-
-void jobqueue_init(JobQueue* q, Job* jobs, int count) {
-    q->jobs = jobs;
-    q->count = count;
-    q->next = 0;
-    pthread_mutex_init(&q->lock, NULL);
+static size_t get_filesize(const char* path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    return (size_t)st.st_size;
 }
 
-Job* jobqueue_pop(JobQueue* q) {
-    pthread_mutex_lock(&q->lock);
-    if (q->next >= q->count) { pthread_mutex_unlock(&q->lock); return NULL; }
-    Job* j = &q->jobs[q->next++];
-    pthread_mutex_unlock(&q->lock);
-    return j;
-}
-
-void* worker_thread(void* arg) {
-    (void)arg;
-    while (1) {
-        Job* job = jobqueue_pop(&g_queue);
-        if (!job) break;
-        int maxDst = LZ4_compressBound((int)job->size);
-        job->comp_buf = (char*)malloc(maxDst);
-        if (!job->comp_buf) { job->comp_size = -1; continue; }
-        int cs = LZ4_compress_default((const char*)job->data, job->comp_buf, (int)job->size, maxDst);
-        if (cs <= 0) {
-            job->comp_size = -1;
-        } else {
-            job->comp_size = cs;
-        }
+static void to_hex(const unsigned char *in, size_t len, char *out_hex) {
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i=0;i<len;i++) {
+        out_hex[i*2] = hex[(in[i]>>4)&0xF];
+        out_hex[i*2+1] = hex[in[i]&0xF];
     }
+    out_hex[len*2] = 0;
+}
+
+// Worker compress thread data
+typedef struct {
+    int thread_id;
+    int nthreads;
+    const char* inpath;
+    FILE* fin; // shared file pointer protected by mutex
+    pthread_mutex_t *file_lock;
+    size_t chunk_size;
+    ChunkResult *results; // preallocated array sized num_chunks
+    size_t total_chunks;
+} WorkerCtx;
+
+static void compute_sha256_cpu(const unsigned char* data, size_t len, unsigned char out[32]) {
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+    SHA256_Update(&ctx, data, len);
+    SHA256_Final(out, &ctx);
+}
+
+static int try_gpu_sha256(const unsigned char* data, size_t len, unsigned char out[32]) {
+    // Call external GPU function; it should return 0 on success
+    // If not linked or returns non-zero, caller will fallback to CPU.
+    int res = -1;
+    // We call the function pointer if available.
+    res = gpu_sha256(data, len, out);
+    return res;
+}
+
+void* worker_func(void* arg) {
+    WorkerCtx* ctx = (WorkerCtx*)arg;
+    int tid = ctx->thread_id;
+    size_t chunk_size = ctx->chunk_size;
+    size_t idx = tid;
+
+    // We'll read chunks from the file with a mutex-protected read pointer
+    while (1) {
+        size_t read_offset;
+        size_t to_read;
+        // Determine next chunk index using a global progress via file seek
+        pthread_mutex_lock(ctx->file_lock);
+        // compute next chunk index from file pointer
+        long curr = ftell(ctx->fin);
+        if (curr < 0) {
+            pthread_mutex_unlock(ctx->file_lock);
+            break;
+        }
+        // get file size
+        fseek(ctx->fin, 0, SEEK_END);
+        long file_end = ftell(ctx->fin);
+        // reset pointer to curr
+        fseek(ctx->fin, curr, SEEK_SET);
+
+        if ((size_t)curr >= (size_t)file_end) {
+            pthread_mutex_unlock(ctx->file_lock);
+            break; // no more chunks
+        }
+        // determine how many bytes to read
+        to_read = (size_t)file_end - (size_t)curr;
+        if (to_read > chunk_size) to_read = chunk_size;
+        read_offset = (size_t)curr;
+
+        // allocate buffer & read
+        unsigned char *buf = (unsigned char*)malloc(to_read);
+        if (!buf) { pthread_mutex_unlock(ctx->file_lock); break; }
+        size_t r = fread(buf, 1, to_read, ctx->fin);
+        pthread_mutex_unlock(ctx->file_lock);
+        if (r == 0) { free(buf); break; }
+
+        // compute SHA256 (try GPU first)
+        unsigned char sha[32];
+        int gres = try_gpu_sha256(buf, r, sha);
+        if (gres != 0) {
+            compute_sha256_cpu(buf, r, sha);
+        }
+
+        // compress chunk with zstd (max level)
+        ZSTD_CCtx* cctx = ZSTD_createCCtx();
+        if (!cctx) { free(buf); break; }
+        int level = ZSTD_maxCLevel(); // maximum compression level supported by lib
+        size_t maxc = ZSTD_compressBound(r);
+        unsigned char* cbuf = (unsigned char*)malloc(maxc);
+        if (!cbuf) { ZSTD_freeCCtx(cctx); free(buf); break; }
+
+        size_t csize = ZSTD_compressCCtx(cctx, cbuf, maxc, buf, r, level);
+        if (ZSTD_isError(csize)) {
+            // compression failed; free and store as uncompressed block (we'll store comp_size=0 to indicate raw)
+            free(cbuf);
+            cbuf = NULL;
+            csize = 0;
+        }
+
+        // determine current chunk id by computing index from read_offset / chunk_size
+        size_t chunk_id = read_offset / chunk_size;
+        if (chunk_id >= ctx->total_chunks) chunk_id = ctx->total_chunks - 1;
+
+        // fill results slot
+        ctx->results[chunk_id].id = (int)chunk_id;
+        ctx->results[chunk_id].orig_size = r;
+        ctx->results[chunk_id].comp_size = csize;
+        memcpy(ctx->results[chunk_id].sha256, sha, 32);
+
+        // store compressed data pointer in results->data as contiguous memory: first 1 byte flag then data
+        // flag: 0 = compressed present, 1 = uncompressed raw
+        if (csize > 0) {
+            ctx->results[chunk_id].data = (unsigned char*)malloc(1 + csize);
+            if (!ctx->results[chunk_id].data) { free(buf); if (cbuf) free(cbuf); ZSTD_freeCCtx(cctx); break; }
+            ctx->results[chunk_id].data[0] = 0;
+            memcpy(ctx->results[chunk_id].data + 1, cbuf, csize);
+        } else {
+            // store raw
+            ctx->results[chunk_id].data = (unsigned char*)malloc(1 + r);
+            if (!ctx->results[chunk_id].data) { free(buf); ZSTD_freeCCtx(cctx); break; }
+            ctx->results[chunk_id].data[0] = 1;
+            memcpy(ctx->results[chunk_id].data + 1, buf, r);
+            ctx->results[chunk_id].comp_size = (size_t)r; // store actual bytes stored
+        }
+
+        free(buf);
+        if (cbuf) free(cbuf);
+        ZSTD_freeCCtx(cctx);
+    }
+
     return NULL;
 }
 
-static uint32_t cpu_hash_fnv1a(const unsigned char* data, size_t len) {
-    uint32_t hash = 2166136261u;
-    for (size_t i = 0; i < len; ++i) {
-        hash ^= (uint32_t)data[i];
-        hash *= 16777619u;
+int compress_file_streaming(const char* inpath, const char* out_dir) {
+    FILE* fin = fopen(inpath, "rb");
+    if (!fin) { perror("open input"); return -1; }
+    size_t total = get_filesize(inpath);
+    if (total == 0) { fclose(fin); fprintf(stderr, "Empty file or stat failure\n"); return -1; }
+    size_t chunk_size = CHUNK_SIZE;
+    size_t num_chunks = (total + chunk_size - 1) / chunk_size;
+
+    // allocate results
+    ChunkResult* results = (ChunkResult*)calloc(num_chunks, sizeof(ChunkResult));
+    if (!results) { fclose(fin); return -1; }
+
+    // prepare worker contexts
+    int nthreads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (nthreads <= 0) nthreads = 1;
+    pthread_t *threads = malloc(sizeof(pthread_t) * nthreads);
+    WorkerCtx *wctx = malloc(sizeof(WorkerCtx) * nthreads);
+    pthread_mutex_t file_lock; pthread_mutex_init(&file_lock, NULL);
+
+    for (int i=0;i<nthreads;i++) {
+        wctx[i].thread_id = i;
+        wctx[i].nthreads = nthreads;
+        wctx[i].inpath = inpath;
+        wctx[i].fin = fin;
+        wctx[i].file_lock = &file_lock;
+        wctx[i].chunk_size = chunk_size;
+        wctx[i].results = results;
+        wctx[i].total_chunks = num_chunks;
     }
-    return hash;
-}
 
-int compress_file_streaming(const char* input_path, const char* out_dir) {
-    FILE* fin = fopen(input_path, "rb");
-    if (!fin) {
-        perror("open input");
-        return -1;
-    }
+    // launch threads
+    for (int i=0;i<nthreads;i++) pthread_create(&threads[i], NULL, worker_func, &wctx[i]);
+    for (int i=0;i<nthreads;i++) pthread_join(threads[i], NULL);
 
-    // get file size
-    if (fseek(fin, 0, SEEK_END) != 0) { perror("fseek"); fclose(fin); return -1; }
-    uint64_t total_size = (uint64_t)ftell(fin);
-    fseek(fin, 0, SEEK_SET);
+    // build output filenames
+    const char* base = strrchr(inpath, '/'); base = base ? base + 1 : inpath;
+    char out_cmp[1024], out_meta[1024];
+    snprintf(out_cmp, sizeof(out_cmp), "%s/%s.cmp", out_dir, base);
+    snprintf(out_meta, sizeof(out_meta), "%s/%s.meta", out_dir, base);
 
-    size_t chunk = CHUNK_SIZE;
-    int num_chunks = (int)((total_size + chunk - 1) / chunk);
+    // write .cmp file (container)
+    FILE* fcmp = fopen(out_cmp, "wb");
+    if (!fcmp) { perror("create cmp"); fclose(fin); return -1; }
+    // header: magic + total_size(8) + chunk_size(8) + num_chunks(8)
+    fwrite("ZSTDCP1", 1, 7, fcmp);
+    uint64_t total_u64 = (uint64_t) total;
+    uint64_t chunk_u64 = (uint64_t) chunk_size;
+    uint64_t chunks_u64 = (uint64_t) num_chunks;
+    fwrite(&total_u64, sizeof(uint64_t), 1, fcmp);
+    fwrite(&chunk_u64, sizeof(uint64_t), 1, fcmp);
+    fwrite(&chunks_u64, sizeof(uint64_t), 1, fcmp);
 
-    if (num_chunks <= 0) {
-        fclose(fin);
-        fprintf(stderr, "Nothing to compress\n");
-        return -1;
-    }
-
-    // allocate job array (num_chunks small for typical files)
-    Job* jobs = (Job*)calloc((size_t)num_chunks, sizeof(Job));
-    if (!jobs) { fclose(fin); fprintf(stderr, "calloc jobs failed\n"); return -1; }
-
-    // read chunks and initialize jobs
-    for (int i = 0; i < num_chunks; ++i) {
-        size_t to_read = (size_t)chunk;
-        uint64_t remain = total_size - ((uint64_t)i * chunk);
-        if (remain < to_read) to_read = (size_t)remain;
-
-        unsigned char* buf = (unsigned char*)malloc(to_read);
-        if (!buf) { fprintf(stderr, "malloc chunk failed\n"); return -1; }
-        size_t r = fread(buf, 1, to_read, fin);
-        if (r != to_read) {
-            fprintf(stderr, "read error: expected %zu got %zu\n", to_read, r);
-            free(buf);
-            return -1;
+    // Write chunk entries: for each chunk, write 1 byte flag + 8 bytes orig_size + 8 bytes stored_size + data
+    for (size_t i=0;i<num_chunks;i++) {
+        // ensure we have results
+        size_t orig = results[i].orig_size;
+        size_t stored = results[i].comp_size;
+        unsigned char flag = 0;
+        if (results[i].data && results[i].data[0]==1) flag = 1; // raw
+        // write: flag (1), orig_size (8), stored_size (8)
+        fwrite(&flag, 1, 1, fcmp);
+        uint64_t orig64 = (uint64_t)orig;
+        uint64_t stored64 = (uint64_t)stored;
+        fwrite(&orig64, sizeof(uint64_t), 1, fcmp);
+        fwrite(&stored64, sizeof(uint64_t), 1, fcmp);
+        if (results[i].data) {
+            fwrite(results[i].data + 1, 1, stored, fcmp);
         }
-        jobs[i].id = i;
-        jobs[i].data = buf;
-        jobs[i].size = to_read;
-        jobs[i].comp_buf = NULL;
-        jobs[i].comp_size = 0;
-
-        // compute hash: try GPU first, else CPU fallback
-        uint32_t h = 0;
-        int gres = gpu_hash_chunk(buf, to_read, &h);
-        if (gres != 0) {
-            // GPU not available or failed -> CPU hash
-            h = cpu_hash_fnv1a(buf, to_read);
-        }
-        jobs[i].hash = h;
     }
+    fclose(fcmp);
 
+    // write meta file (plain text) with: chunk_id orig_size comp_size sha256hex
+    FILE* fmeta = fopen(out_meta, "w");
+    if (!fmeta) { perror("create meta"); fclose(fin); return -1; }
+    for (size_t i=0;i<num_chunks;i++) {
+        char hex[65];
+        to_hex(results[i].sha256, 32, hex);
+        fprintf(fmeta, "%zu %zu %zu %s\n", i, results[i].orig_size, results[i].comp_size, hex);
+    }
+    fclose(fmeta);
+
+    // cleanup
+    for (size_t i=0;i<num_chunks;i++) {
+        if (results[i].data) free(results[i].data);
+    }
+    free(results);
+    free(threads);
+    free(wctx);
+    pthread_mutex_destroy(&file_lock);
     fclose(fin);
 
-    // prepare queue and workers
-    jobqueue_init(&g_queue, jobs, num_chunks);
-    int nthreads = sysconf(_SC_NPROCESSORS_ONLN);
-    if (nthreads < 1) nthreads = 1;
-    pthread_t* threads = (pthread_t*)malloc(nthreads * sizeof(pthread_t));
-    for (int t = 0; t < nthreads; ++t) pthread_create(&threads[t], NULL, worker_thread, NULL);
-
-    for (int t = 0; t < nthreads; ++t) pthread_join(threads[t], NULL);
-
-    // Build output paths
-    const char* baseptr = strrchr(input_path, '/');
-    const char* basename = baseptr ? baseptr + 1 : input_path;
-    char out_cmp[1024]; char out_meta[1024];
-    snprintf(out_cmp, sizeof(out_cmp), "%s/%s.cmp", out_dir, basename);
-    snprintf(out_meta, sizeof(out_meta), "%s/%s.meta", out_dir, basename);
-
-    // ensure directory exists
-    mkdir(out_dir, 0755);
-
-    // Write compressed container
-    FILE* fcmp = fopen(out_cmp, "wb");
-    FILE* fmeta = fopen(out_meta, "w");
-    if (!fcmp || !fmeta) { perror("create out files"); return -1; }
-
-    // header: total_size (8 bytes), chunk_size (8), num_chunks (4)
-    fwrite(&total_size, sizeof(uint64_t), 1, fcmp);
-    uint64_t chunk_u64 = (uint64_t)chunk;
-    fwrite(&chunk_u64, sizeof(uint64_t), 1, fcmp);
-    fwrite(&num_chunks, sizeof(int), 1, fcmp);
-
-    // write chunks in order
-    for (int i = 0; i < num_chunks; ++i) {
-        int cs = jobs[i].comp_size;
-        // meta line: id orig_size comp_size hash
-        fprintf(fmeta, "%d %zu %d %u\n", i, jobs[i].size, cs, jobs[i].hash);
-
-        // write comp_size (4 bytes) then data if available
-        fwrite(&cs, sizeof(int), 1, fcmp);
-        if (cs > 0) {
-            fwrite(jobs[i].comp_buf, 1, cs, fcmp);
-        } else {
-            // compression failed, write raw uncompressed data: write -1 then raw bytes length and bytes
-            int raw_flag = -1;
-            fwrite(&raw_flag, sizeof(int), 1, fcmp); // marker
-            uint64_t orig_s = jobs[i].size;
-            fwrite(&orig_s, sizeof(uint64_t), 1, fcmp);
-            fwrite(jobs[i].data, 1, jobs[i].size, fcmp);
-        }
-        // free chunk buffers
-        if (jobs[i].comp_buf) free(jobs[i].comp_buf);
-        if (jobs[i].data) free(jobs[i].data);
-    }
-
-    fclose(fcmp);
-    fclose(fmeta);
-    free(jobs);
-    free(threads);
-
-    printf("Compressed -> %s and metadata -> %s\n", out_cmp, out_meta);
+    printf("Compressed -> %s\nMetadata -> %s\nChunks: %zu\n", out_cmp, out_meta, num_chunks);
     return 0;
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) {
+    if (argc != 3) {
         printf("Usage: %s <input.bin> <compress_dir>\n", argv[0]);
         return 1;
     }
+    // ensure out dir exists
+    mkdir(argv[2], 0755);
     return compress_file_streaming(argv[1], argv[2]);
 }
